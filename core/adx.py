@@ -22,10 +22,24 @@ async def fetch_candles(count: int | None = None) -> list[dict[str, float]] | No
       [{"time": ..., "open": ..., "high": ..., "low": ..., "close": ...}, ...]
 
     Coinbase returns candles newest-first, so we reverse.
-    We request *count* candles (default: cfg.ADX_CANDLE_COUNT).
+    We use explicit start/end params to guarantee Coinbase returns exactly
+    cfg.ADX_CANDLE_COUNT (300) candles — the maximum the API allows.
     """
+    import time as _time
+
     n = count or cfg.ADX_CANDLE_COUNT
-    params = {"granularity": 300}  # 300s = 5 minutes
+    granularity = 300  # 5 minutes in seconds
+
+    # Pin the time window so Coinbase returns exactly n candles.
+    # end = now (unix epoch seconds), start = now - n * granularity
+    end_ts = int(_time.time())
+    start_ts = end_ts - n * granularity
+
+    params = {
+        "granularity": granularity,
+        "start": start_ts,
+        "end": end_ts,
+    }
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -41,13 +55,13 @@ async def fetch_candles(count: int | None = None) -> list[dict[str, float]] | No
         return None
 
     # Coinbase format: [time, low, high, open, close, volume] — newest first
-    # Take only the candles we need, then reverse to oldest-first
+    # Take ALL returned candles (do NOT slice to n — we need all for warm-up)
     candles = []
-    for row in raw[:n]:
+    for row in raw:
         try:
             candles.append({
                 "time": float(row[0]),
-                "low": float(row[1]),
+                "low":  float(row[1]),
                 "high": float(row[2]),
                 "open": float(row[3]),
                 "close": float(row[4]),
@@ -63,8 +77,6 @@ async def fetch_candles(count: int | None = None) -> list[dict[str, float]] | No
 
     candles.reverse()  # oldest first
     return candles
-
-
 def compute_adx(candles: list[dict[str, float]], length: int | None = None) -> list[float] | None:
     """Compute ADX series from candle data using Wilder's smoothing.
 
@@ -87,10 +99,11 @@ def compute_adx(candles: list[dict[str, float]], length: int | None = None) -> l
     """
     n = length or cfg.ADX_LENGTH
 
-    if len(candles) < (2 * n + 1):
+    min_candles = 3 * n  # need 3×period for ADX to meaningfully converge
+    if len(candles) < min_candles:
         log.error(
-            "Not enough candles for ADX(%d): have %d, need at least %d",
-            n, len(candles), 2 * n + 1,
+            "Not enough candles for ADX(%d): have %d, need at least %d (3×period for convergence)",
+            n, len(candles), min_candles,
         )
         return None
 
