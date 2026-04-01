@@ -1,80 +1,105 @@
-"""Gamma API poller — checks whether a 5-min slot has resolved (WIN / LOSS)."""
+"""Coinbase candle resolver — determines 5-min slot winner (Up/Down) from BTC-USD candle data.
+
+Instead of polling the Gamma API for market resolution, this module fetches
+the single 5-minute candle from Coinbase covering the slot window and compares
+close vs open:
+  - close >= open  →  winner = "Up"
+  - close <  open  →  winner = "Down"
+
+resolve_slot() retries up to 3 times at 5-second intervals (15 s worst case).
+check_resolution() performs a single attempt with no retries.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from typing import Any
 
 import httpx
+
 import config as cfg
 
 log = logging.getLogger(__name__)
 
-MAX_POLL_ATTEMPTS = 40  # 20 x 15s + 20 x 30s = ~10 minutes total
-POLL_INTERVAL_FAST = 15  # seconds — used for attempts 1-20
-POLL_INTERVAL_SLOW = 30  # seconds — used for attempts 21-40
+MAX_RETRIES = 3       # resolve_slot retries before giving up
+RETRY_INTERVAL = 5    # seconds between retries
 
 
-async def check_resolution(slug: str) -> tuple[str | None, bool]:
-    """Single check — hit Gamma API and inspect outcomePrices.
+def _extract_slot_start_ts(slug: str) -> int:
+    """Extract the slot-start unix timestamp from a slug.
 
-    Returns (winning_side, True) if resolved, (None, False) if still open.
+    Slug format: "btc-updown-5m-{unix_ts}" (may have more segments).
+    Always splits from the right to handle any prefix safely.
     """
-    url = f"{cfg.GAMMA_API_HOST}/markets"
-    params = {"slug": slug}
+    return int(slug.rsplit("-", 1)[-1])
+
+
+async def _fetch_candle(slot_start_ts: int) -> tuple[float, float] | None:
+    """Fetch the single 5-min candle for *slot_start_ts* from Coinbase.
+
+    Returns (open, close) on success, or None if the candle is unavailable.
+    """
+    params = {
+        "granularity": 300,
+        "start": slot_start_ts,
+        "end": slot_start_ts + 300,
+    }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(cfg.COINBASE_CANDLE_URL, params=params)
             resp.raise_for_status()
             data = resp.json()
     except Exception:
-        log.exception("Gamma API error while resolving slug=%s", slug)
-        return None, False
+        log.exception("Coinbase candle fetch failed for ts=%d", slot_start_ts)
+        return None
 
     if not data or not isinstance(data, list) or len(data) == 0:
-        return None, False
+        log.warning("Coinbase returned no candle for ts=%d", slot_start_ts)
+        return None
 
-    market = data[0]
+    # Coinbase format: [time, low, high, open, close, volume] — newest first
     try:
-        outcomes = market["outcomes"]
-        if isinstance(outcomes, str):
-            outcomes = json.loads(outcomes)
-        prices_raw = market["outcomePrices"]
-        if isinstance(prices_raw, str):
-            prices_raw = json.loads(prices_raw)
-        prices = [float(p) for p in prices_raw]
-    except (KeyError, ValueError, IndexError):
-        log.exception("Parse error for slug=%s", slug)
+        candle = data[0]
+        open_price = float(candle[3])
+        close_price = float(candle[4])
+        return open_price, close_price
+    except (IndexError, ValueError, TypeError):
+        log.exception("Failed to parse Coinbase candle for ts=%d", slot_start_ts)
+        return None
+
+
+async def check_resolution(slug: str) -> tuple[str | None, bool]:
+    """Single-attempt resolution check via Coinbase candle data.
+
+    Returns (winning_side, True) if the candle is available,
+    or (None, False) if the data is not yet available.
+    """
+    slot_start_ts = _extract_slot_start_ts(slug)
+    result = await _fetch_candle(slot_start_ts)
+
+    if result is None:
         return None, False
 
-    # Resolved when one side = 1.00 and the other = 0.00
-    for idx, price in enumerate(prices):
-        if price >= 0.99:
-            winner = outcomes[idx]
-            log.info("Slot %s resolved: winner=%s", slug, winner)
-            return winner, True
-
-    return None, False
+    open_price, close_price = result
+    winner = "Up" if close_price >= open_price else "Down"
+    log.info("Slot %s resolved: winner=%s (open=%.2f, close=%.2f)", slug, winner, open_price, close_price)
+    return winner, True
 
 
 async def resolve_slot(slug: str) -> str | None:
-    """Poll until the slot resolves or we exhaust retries.
+    """Fetch the Coinbase candle for the slot, retrying up to MAX_RETRIES times.
 
-    First 20 attempts poll every 15s; remaining attempts poll every 30s
-    to avoid hammering the API. Total window: ~10 minutes.
-
-    Returns the winning side ("Up" or "Down") or None if unresolved.
+    Retries at RETRY_INTERVAL-second intervals.  Worst case: 15 seconds
+    (3 attempts × 5 s).  Returns the winning side ("Up" or "Down") or None
+    if the candle could not be retrieved after all attempts.
     """
-    for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
+    for attempt in range(1, MAX_RETRIES + 1):
         winner, resolved = await check_resolution(slug)
         if resolved:
             return winner
-        log.debug("Slot %s not yet resolved (attempt %d/%d)", slug, attempt, MAX_POLL_ATTEMPTS)
-        if attempt < MAX_POLL_ATTEMPTS:
-            interval = POLL_INTERVAL_FAST if attempt <= 20 else POLL_INTERVAL_SLOW
-            await asyncio.sleep(interval)
+        log.debug("Slot %s not yet resolved (attempt %d/%d)", slug, attempt, MAX_RETRIES)
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(RETRY_INTERVAL)
 
-    log.warning("Slot %s did not resolve after %d attempts", slug, MAX_POLL_ATTEMPTS)
+    log.warning("Slot %s did not resolve after %d attempts", slug, MAX_RETRIES)
     return None
