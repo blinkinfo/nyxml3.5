@@ -1,9 +1,9 @@
-"""Pattern strategy -- 6-candle historical pattern matching on BTC-USD.
+"""Pattern strategy -- historical pattern matching on BTC-USD.
 
 Flow:
 1. Fetch the most recently *closed* 5-min BTC-USD candles from Coinbase
-2. Read directions of N-1 through N-6 (6 most recent fully closed)
-3. Build 6-char string (N-1 N-2 ... N-6, left to right) using U for up, D for down
+2. Read directions of up to 7 most recent fully closed candles
+3. Build pattern strings at depth 7, 6, and 5 (longest-first greedy match)
 4. Look up string in pattern table
 5. If match -> trade predicted direction for N+1 candle
 6. If no match -> skip
@@ -37,14 +37,19 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Pattern table
 # ---------------------------------------------------------------------------
-# Key format: 6-character string where each character represents one 5-min
-# BTC-USD candle direction.  Characters are ordered LEFT-TO-RIGHT as:
-#   [N-1][N-2][N-3][N-4][N-5][N-6]
-# where N-1 is the most-recently CLOSED candle and N-6 is the oldest.
+# Key format: variable-length string (4-7 characters) where each character
+# represents one 5-min BTC-USD candle direction.  Characters are ordered
+# LEFT-TO-RIGHT as:
+#   [N-1][N-2]...[N-k]
+# where N-1 is the most-recently CLOSED candle and N-k is the oldest.
 # U = close >= open (up), D = close < open (down).
 # Value = predicted direction for the NEXT candle (N+1): "UP" or "DOWN".
+#
+# Scan order: [_PATTERN_DEPTHS] longest-first (7 > 6 > 5).  Greedy -- the
+# first matching depth wins, giving highest specificity to longer patterns.
 
 PATTERN_TABLE: dict[str, str] = {
+    # -- 6-char patterns --
     "DDDDDD": "UP",
     "DUUUDU": "DOWN",
     "DUUUUD": "DOWN",
@@ -64,6 +69,13 @@ PATTERN_TABLE: dict[str, str] = {
     "UUDUUD": "UP",
     "DDUDDD": "UP",
     "DUDDDU": "DOWN",
+    # -- 7-char patterns --
+    "DDDUDDD": "UP",
+    "DUDDDDD": "UP",
+    "UDUUUUU": "UP",
+    "UDUUUUD": "DOWN",
+    # -- 5-char patterns --
+    "DDDUU": "DOWN",
 }
 
 
@@ -71,7 +83,7 @@ PATTERN_TABLE: dict[str, str] = {
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-async def _fetch_candles(count: int = 10) -> list[dict[str, float]] | None:
+async def _fetch_candles(count: int = 12) -> list[dict[str, float]] | None:
     """Fetch the *count* most recently CONFIRMED-CLOSED 5-min BTC-USD candles.
 
     Implementation details
@@ -156,9 +168,11 @@ def _build_pattern_string(candles: list[dict[str, float]], depth: int = 6) -> st
       position 0 = direction of candles[-1]  (N-1, most recent closed)
       position 1 = direction of candles[-2]  (N-2)
       ...
-      position 5 = direction of candles[-6]  (N-6, oldest in window)
+      position k = direction of candles[-k-1] (N-k, oldest in window)
 
-    This matches the PATTERN_TABLE key format: [N-1][N-2][N-3][N-4][N-5][N-6].
+    This matches the PATTERN_TABLE key format: [N-1][N-2]...[N-k].
+
+    Supported depths: 5, 6, 7 (configured via _PATTERN_DEPTHS).
     """
     if len(candles) < depth:
         log.warning(
@@ -181,21 +195,21 @@ def _build_pattern_string(candles: list[dict[str, float]], depth: int = 6) -> st
 # ---------------------------------------------------------------------------
 
 class PatternStrategy(BaseStrategy):
-    """6-candle historical pattern matching strategy.
+    """Multi-depth historical pattern matching strategy.
 
-    Implements the BaseStrategy interface.  check_signal() is the sole public
-    method; it returns either:
+    Scans candle history at multiple depths (7, 6, 5) using a longest-first
+    greedy match.  Returns either:
       - None                  on hard failure (network, parse error)
-      - {"skipped": True, ...}  when no pattern match
+      - {"skipped": True, ...}  when no pattern matches at any depth
       - {"skipped": False, ...} with full trade fields when a match is found
     """
 
     # Number of confirmed-closed candles to fetch from Coinbase.
-    # Must be >= PATTERN_DEPTH + 1 so the safety drop still leaves enough.
-    _CANDLE_FETCH_COUNT: int = 10
+    # Must be >= max(_PATTERN_DEPTHS) + 1 so the safety drop still leaves enough.
+    _CANDLE_FETCH_COUNT: int = 12
 
-    # Number of candles used to build the pattern string.
-    _PATTERN_DEPTH: int = 6
+    # Depths to scan, checked longest-first (greedy match).
+    _PATTERN_DEPTHS: list[int] = [7, 6, 5]
 
     async def check_signal(self) -> dict[str, Any] | None:
         """Generate a pattern-based signal for slot N+1.
@@ -204,37 +218,47 @@ class PatternStrategy(BaseStrategy):
 
         Steps:
           1. Fetch confirmed-closed BTC-USD 5-min candles
-          2. Build 6-char pattern from the most recent 6 closed candles
-          3. Look up pattern in PATTERN_TABLE
+          2. Build pattern strings at depths 7, 6, 5 (longest-first)
+          3. Look up each pattern in PATTERN_TABLE; first match wins
           4. On match: fetch Polymarket prices, return full signal dict
           5. On no match: return skip dict (no trade placed)
         """
         candles = await _fetch_candles(count=self._CANDLE_FETCH_COUNT)
         if candles is None:
-            log.error("PatternStrategy: candle fetch failed — aborting signal check")
+            log.error("PatternStrategy: candle fetch failed \u2014 aborting signal check")
             return None
 
-        pattern = _build_pattern_string(candles, depth=self._PATTERN_DEPTH)
-        if pattern is None:
-            log.error("PatternStrategy: could not build pattern string from %d candles", len(candles))
-            return None
+        # Greedy longest-first match across all configured depths.
+        matched_depth: int | None = None
+        pattern: str | None = None
+        prediction: str | None = None
 
-        prediction = PATTERN_TABLE.get(pattern)
-
-        # Always compute slot info (needed for both skip and trade paths).
-        slot_n1 = get_next_slot_info()
+        for d in self._PATTERN_DEPTHS:
+            p = _build_pattern_string(candles, depth=d)
+            if p is None:
+                continue
+            # Keep shallowest candidate so we always have one for skip logging.
+            pattern = p
+            pred = PATTERN_TABLE.get(p)
+            if pred is not None and matched_depth is None:
+                matched_depth = d
+                prediction = pred
 
         if prediction is None:
+            # No match at any depth.  pattern holds the shallowest (last) attempt.
             log.info(
-                "PatternStrategy: pattern '%s' not in table -> SKIP (slot %s-%s UTC)",
+                "PatternStrategy: no match at any depth [%s] -> SKIP "
+                "(shallowest pattern '%s', slot %s-%s UTC)",
+                ", ".join(str(d) for d in self._PATTERN_DEPTHS),
                 pattern,
+                slot_n1 := get_next_slot_info(),
                 slot_n1["slot_start_str"],
                 slot_n1["slot_end_str"],
             )
             return {
                 "skipped": True,
-                "pattern": pattern,
-                "candles_used": self._PATTERN_DEPTH,
+                "pattern": pattern,  # type: ignore[arg-type]
+                "candles_used": self._PATTERN_DEPTHS[-1],
                 "slot_n1_start_full": slot_n1["slot_start_full"],
                 "slot_n1_end_full":   slot_n1["slot_end_full"],
                 "slot_n1_start_str":  slot_n1["slot_start_str"],
@@ -246,12 +270,13 @@ class PatternStrategy(BaseStrategy):
         side = "Up" if prediction == "UP" else "Down"
 
         # Fetch live Polymarket prices for N+1 slot.
+        slot_n1 = get_next_slot_info()
         prices = await get_slot_prices(slot_n1["slug"])
         if prices is None:
             log.error(
-                "PatternStrategy: pattern '%s' -> %s matched but Polymarket price "
-                "fetch failed for slot %s — aborting signal",
-                pattern, prediction, slot_n1["slug"],
+                "PatternStrategy: pattern '%s' (depth %d) -> %s matched but Polymarket price "
+                "fetch failed for slot %s \u2014 aborting signal",
+                pattern, matched_depth, prediction, slot_n1["slug"],
             )
             return None
 
@@ -260,9 +285,10 @@ class PatternStrategy(BaseStrategy):
         token_id       = prices["up_token_id"] if side == "Up" else prices["down_token_id"]
 
         log.info(
-            "PatternStrategy: MATCH '%s' -> %s | slot %s-%s UTC | "
+            "PatternStrategy: MATCH '%s' at depth %d -> %s | slot %s-%s UTC | "
             "entry=$%.4f | token=%s",
             pattern,
+            matched_depth,
             prediction,
             slot_n1["slot_start_str"],
             slot_n1["slot_end_str"],
@@ -277,7 +303,7 @@ class PatternStrategy(BaseStrategy):
             "opposite_price":     opposite_price,
             "token_id":           token_id,
             "pattern":            pattern,
-            "candles_used":       self._PATTERN_DEPTH,
+            "candles_used":       matched_depth,
             "slot_n1_start_full": slot_n1["slot_start_full"],
             "slot_n1_end_full":   slot_n1["slot_end_full"],
             "slot_n1_start_str":  slot_n1["slot_start_str"],
