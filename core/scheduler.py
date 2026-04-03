@@ -336,6 +336,17 @@ async def _auto_redeem_job() -> None:
 
 async def _check_and_trade() -> None:
     """Core loop body — called at T-85s for each slot."""
+    # --- Hour filter: skip trading during blocked UTC hours ---
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.hour in cfg.BLOCKED_TRADE_HOURS_UTC:
+        log.info(
+            "Hour filter: skipping slot at %s UTC (blocked hours: %s)",
+            now_utc.strftime("%H:%M"),
+            sorted(cfg.BLOCKED_TRADE_HOURS_UTC),
+        )
+        _schedule_next()
+        return
+
     from bot.formatters import (
         format_signal,
         format_skip,

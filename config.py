@@ -64,3 +64,15 @@ SIGNAL_LEAD_TIME: int = 85  # seconds before slot end to check signal
 # ---------------------------------------------------------------------------
 # Scheduler interval (minutes) between automatic redemption scans.
 AUTO_REDEEM_INTERVAL_MINUTES: int = int(os.getenv("AUTO_REDEEM_INTERVAL_MINUTES", "5"))
+
+# ---------------------------------------------------------------------------
+# Hour Filter
+# ---------------------------------------------------------------------------
+# UTC hours during which trading is blocked (0-23). Comma-separated in env.
+# Default: 3 and 17 (03:XX UTC and 17:XX UTC).
+# To change without redeploying, set BLOCKED_TRADE_HOURS_UTC=3,17 in env vars.
+BLOCKED_TRADE_HOURS_UTC: frozenset[int] = frozenset(
+    int(h.strip())
+    for h in os.getenv("BLOCKED_TRADE_HOURS_UTC", "3,17").split(",")
+    if h.strip().isdigit()
+)
