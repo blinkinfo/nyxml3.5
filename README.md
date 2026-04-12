@@ -1,369 +1,458 @@
-# NyxBot - BTC 5-Min Pattern Trading Bot
+# 🤖 AutoPoly — Polymarket BTC Binary Options Trading Bot
 
-<div align="center">
-
-Automated Polymarket trading bot for BTC 5-minute Up/Down binary options.
-Matches **multi-depth candle patterns** (5-7 candles) against a table of historically-validated sequences,
-executes **Fill-Or-Kill orders** via Telegram, and **auto-redeems** winning positions on-chain.
-
-[Features](#-features) • [How It Works](#-how-it-works) • [Setup](#-setup) • [Commands](#-telegram-bot-commands) • [Architecture](#-architecture) • [Deploy](#-deployment)
-
-</div>
+AutoPoly is a fully automated trading bot for **Polymarket BTC 5-minute Up/Down binary options markets**. It combines a pluggable prediction strategy engine (ML or pattern-matching), an APScheduler-driven execution loop, Fill-or-Kill CLOB order placement, on-chain position redemption, and a full Telegram bot interface — all backed by a local SQLite database.
 
 ---
 
-## ✨ Features
+## 📋 Table of Contents
 
-| | |
-|---|---|
-| **Multi-Depth Pattern Matching** | Greedy 7/6/5-candle scan -- longest match wins |
-| **Live Telegram Dashboard** | Real-time signals, P&L stats, inline analytics |
-| **Auto-Trading (FOK)** | Fill-Or-Kill orders with retry + time-fence guards |
-| **Demo Mode** | Paper-trade with a virtual $1,000 bankroll, zero risk |
-| **Auto-Redeem** | Scans & reclaims resolved positions on-chain via web3.py |
-| **Gnosis Safe Support** | Sig-type-2 redemptions routed through Safe.execTransaction |
-| **Trade Sizing Modes** | Fixed USDC amount or percentage of balance |
-| **Hour Filter** | Block trading during specific UTC hours |
-| **Data Export** | Download signals & pattern stats as CSV or Excel |
-| **SQLite Persistence** | All data survives restarts; unresolved signals auto-recover |
-| **Single-Chat Auth** | Locked to your authorized Telegram chat ID |
-| **Pluggable Strategies** | Registry-based -- add new strategies without touching core |
-| **Railway-Ready** | One-click deploy with Procfile |
+- [Overview](#-overview)
+- [Architecture](#-architecture)
+- [Directory Structure](#-directory-structure)
+- [Trading Modes](#-trading-modes)
+- [Strategy Engine](#-strategy-engine)
+- [ML Model Pipeline](#-ml-model-pipeline)
+- [Scheduler Loop](#-scheduler-loop)
+- [Bot Commands](#-telegram-bot-commands)
+- [Configuration](#-configuration--environment-variables)
+- [Database Schema](#-database-schema)
+- [Setup & Deployment](#-setup--deployment)
+- [Key Constants & Thresholds](#-key-constants--thresholds)
 
 ---
 
-## 🔍 How It Works
+## 🔍 Overview
 
-### The Pattern Strategy
+AutoPoly monitors Polymarket's BTC-USDT 5-minute binary markets around the clock. Every slot (`:00`, `:05`, ... `:55`), it:
 
-Every 5 minutes, Polymarket opens a binary market: **"Will BTC go Up or Down in the next 5 minutes?"**
+1. Fires a signal check **85 seconds before slot end** (T−85s)
+2. Runs the active prediction strategy (ML or Pattern)
+3. If a strong enough signal is found, places a **Fill-or-Kill market order** on the Polymarket CLOB
+4. Records the trade in SQLite
+5. After slot expiry, **resolves** the outcome and **redeems** any winning positions on-chain
+6. Sends Telegram notifications for every key event
 
-NyxBot watches BTC/USD candles on Coinbase, matches the most recent closed candles against a table of historically-validated patterns, and predicts the next candle's direction.
-
-**At T-85s** (85 seconds before the slot closes), the bot:
-
-1. **Fetches** 12 recent 5-minute BTC-USD candles from Coinbase (~25-hour window)
-2. **Drops** the tail candle (still-forming at T-85s) -- ensures only confirmed-closed data
-3. **Builds pattern strings** at depths 7, 6, and 5 (longest-first, greedy match)
-   - `U` = candle closed >= opened (green)
-   - `D` = candle closed < opened (red)
-4. **Looks up** each pattern in the pattern table -- first (longest) match wins
-5. **If matched** -> fires a signal with the predicted direction (Up or Down)
-6. **If no match** -> skips the slot, logs it, notifies you on Telegram
-
-### Multi-Depth Pattern Table
-
-The bot scans at **three depths simultaneously**. Longer patterns are preferred (greedy match), giving higher specificity.
-
-**7-Candle Patterns (4 patterns)**
-
-| Pattern | Prediction |
-|---------|------------|
-| `DDDUDDD` | UP |
-| `DUDDDDD` | UP |
-| `UDUUUUU` | UP |
-| `UDUUUUD` | DOWN |
-
-**6-Candle Patterns (15 patterns)**
-
-| Pattern | Prediction | |
-|---------|------------|-|
-| `DDDDDD` | UP | `DUUUDU` -> DOWN |
-| `DUUUUD` | DOWN | `DUUUDD` -> DOWN |
-| `UDDUUD` | UP | `DUUDDD` -> UP |
-| `DUDUDU` | DOWN | `UUDUUU` -> DOWN |
-| `DUDUUD` | UP | `DDUDDU` -> UP |
-| `DDDUUD` | DOWN | `UUUDUD` -> DOWN |
-| `UDUUDU` | DOWN | `DDUDDD` -> UP |
-| `DUDDDU` | DOWN |
-
-**5-Candle Patterns (1 pattern)**
-
-| Pattern | Prediction |
-|---------|------------|
-| `DDDUU` | DOWN |
-
-> **20 total patterns** across 3 depths. All are hardcoded in `core/strategies/pattern_strategy.py` and can be extended.
-
-### Signal Flow
-
-```
-[Every 5 min at T-85s]
-  ├─ 1. PatternStrategy fetches 12 candles from Coinbase
-  ├─ 2. Drops tail candle (safety), keeps 11 confirmed-closed
-  ├─ 3. Greedy scan: depth 7 -> 6 -> 5, first match wins
-  ├─ 4. Match? fetch Polymarket prices, return signal dict
-  ├─ 5. No match? return skip, log shallowest pattern
-  ├─ 6. Hour filter checks: is this a blocked UTC hour?
-  ├─ 7. Signal persisted to DB
-  ├─ 8. TradeManager gate (passthrough) proceeds
-  ├─ 9. AutoTrade ON? place FOK order with retry logic
-  ├─ 10. Demo mode ON? simulate trade, deduct bankroll
-  └─ 11. Schedule resolution for slot_end + 30s
-
-[Resolution: slot_end + 30s]
-  ├─ 1. Poll Coinbase for the slot's candle (up to 5 retries)
-  ├─ 2. close >= open => "Up", else "Down"
-  ├─ 3. P&L: win = amount * (1/entry - 1), loss = -amount
-  ├─ 4. Update signal + trade in DB
-  └─ 5. Send resolution notification on Telegram
-
-[Background Jobs]
-  ├─ Reconciler: every 5 min, retries stuck resolutions from persistent queue
-  ├─ Auto-Redeem: scans wallet for resolved positions, redeems on-chain
-  └─ Startup Recovery: resolves any unresolved signals from previous run
-```
-
-### Order Execution (AutoTrade)
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `FOK_MAX_RETRIES` | `3` | Max retry attempts per slot |
-| `FOK_RETRY_DELAY_BASE` | `2.0s` | Initial backoff delay |
-| `FOK_RETRY_DELAY_MAX` | `5.0s` | Maximum backoff ceiling |
-| `FOK_SLOT_CUTOFF_SECONDS` | `30` | Abort if < 30s remain in slot |
-
-- Uses **Fill-Or-Kill (FOK)** market orders via `py-clob-client`
-- Exponential backoff: 2s -> 4s -> 5s between retries
-- **Time fence**: aborts if too close to slot end
-- **Duplicate guard**: checks DB before each retry to prevent double-fills
-
-### On-Chain Redemption
-
-NyxBot supports two wallet types:
-
-**EOA (Direct)**
-- Private key directly controls the wallet
-- `POLYMARKET_SIGNATURE_TYPE` = 1
-- `POLYMARKET_FUNDER_ADDRESS` = the EOA address
-
-**Gnosis Safe (Proxy)**
-- EOA signs, Safe acts as msg.sender on CTF contract
-- `POLYMARKET_SIGNATURE_TYPE` = 2
-- `POLYMARKET_FUNDER_ADDRESS` = the Safe/proxy address
-- Redemptions routed through `Safe.execTransaction()`
-- Startup sanity check verifies EOA is a Safe owner
-
-The redeemer:
-1. Scans the Polymarket Data API for positions with `redeemable=true`
-2. Filters settled markets only (`curPrice >= 0.99` or `<= 0.01`)
-3. Calls `CTF.redeemPositions()` with `indexSets=[1,2]` (handles both won/lost)
-4. Verifies post-tx position balances are zero
-5. Records results in the DB
-
----
-
-## ⚙ Configuration
-
-### Required Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `POLYMARKET_PRIVATE_KEY` | Ethereum private key (signer EOA) |
-| `POLYMARKET_FUNDER_ADDRESS` | Wallet address (EOA or Safe) |
-| `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_CHAT_ID` | Your authorized Telegram chat ID |
-
-### Optional Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `POLYMARKET_SIGNATURE_TYPE` | `2` | `2` = Gnosis Safe, `1` = direct EOA |
-| `TRADE_AMOUNT_USDC` | `1.0` | Fixed trade size in USDC |
-| `TRADE_MODE` | `fixed` | `fixed` or `pct` |
-| `TRADE_PCT` | `5.0` | Trade as % of balance (when mode is `pct`) |
-| `FOK_MAX_RETRIES` | `3` | Max FOK order retry attempts |
-| `FOK_RETRY_DELAY_BASE` | `2.0` | Base retry delay (seconds) |
-| `FOK_RETRY_DELAY_MAX` | `5.0` | Max retry delay (seconds) |
-| `FOK_SLOT_CUTOFF_SECONDS` | `30` | Abort if less than this time remains in slot |
-| `AUTO_REDEEM_INTERVAL_MINUTES` | `5` | How often auto-redeem scans |
-| `POLYGON_RPC_URL` | `https://polygon-rpc.com` | RPC for on-chain redemptions |
-| `DB_PATH` | `autopoly.db` | SQLite database file |
-| `STRATEGY_NAME` | `ml` | Active strategy module name |
-| `BLOCKED_TRADE_HOURS_UTC` | `3,17` | UTC hours to skip trading (comma-separated) |
-
-### Trade Sizing Modes
-
-**Fixed Mode** (`TRADE_MODE=fixed`)
-- Each trade uses `TRADE_AMOUNT_USDC` (default $1.00)
-- Configurable from Telegram: `/settings` -> Change Amount
-
-**Percentage Mode** (`TRADE_MODE=pct`)
-- Each trade uses `TRADE_PCT`% of demo or real balance
-- Minimum trade is always $1.00 (Polymarket limit)
-- Configurable from Telegram: `/settings` -> Toggle Trade Mode
-
-### Hour Filter
-
-Trading is blocked during the UTC hours defined in `BLOCKED_TRADE_HOURS_UTC`.
-Default blocks `03:00-03:59 UTC` and `17:00-17:59 UTC`.
-Change without redeploying: set the env var and restart.
-
----
-
-## 🚀 Setup
-
-### Prerequisites
-
-- **Python 3.10+**
-- **Polymarket account** with funded Polygon wallet
-- **Telegram bot token** from [@BotFather](https://t.me/BotFather)
-- **Ethereum private key** for your Polymarket wallet
-
-### Local Development
-
-```bash
-# Clone the repo
-git clone https://github.com/your-org/nyx.git
-cd nyx
-
-# Create virtual environment and install dependencies
-python -m venv .venv
-source .venv/bin/activate  # or: .venv\Scripts\activate on Windows
-pip install -r requirements.txt
-
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your credentials
-
-# Run the bot
-python main.py
-```
-
-### Telegram Bot Setup
-
-1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, follow prompts
-2. Copy the bot token -> `TELEGRAM_BOT_TOKEN`
-3. Message your new bot (any text)
-4. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates`
-5. Find your `chat.id` in the JSON -> `TELEGRAM_CHAT_ID`
-
----
-
-## 📱 Telegram Bot Commands
-
-### Navigation
-
-| Command | Description |
-|---------|-------------|
-| `/start` | Welcome message and main menu |
-| `/status` | Portfolio overview, balance, uptime, last signal |
-| `/settings` | Toggle autotrade, change sizing, manage demo |
-| `/help` | Command reference and strategy explanation |
-
-### Analytics
-
-| Command | Description |
-|---------|-------------|
-| `/signals` | Signal win rate, streaks, recent history |
-| `/trades` | Trade P&L, deployed capital, ROI |
-| `/patterns` | Per-pattern performance dashboard |
-| `/demo` | Simulated bankroll and virtual trade history |
-| `/redemptions` | On-chain redemption history |
-
-### Actions
-
-| Command | Description |
-|---------|-------------|
-| `/redeem` | Scan and redeem resolved positions (dry-run preview then confirm) |
-
-### Interactive Features
-
-The bot provides inline keyboards for:
-- **Time Filters**: Last 10 / Last 50 / All Time (signals, trades, demo)
-- **Pattern Filters**: Last 50 / Last 200 / All Time (pattern stats)
-- **Toggles**: AutoTrade ON/OFF, Auto-Redeem ON/OFF, Demo ON/OFF, Trade Mode (Fixed/Pct)
-- **Input Modes**: Set trade amount ($), set trade percentage (%), set demo bankroll, reset demo
-- **Exports**: Download CSV or Excel of signals and pattern stats
+The system supports both **demo** (simulated P&L) and **live** (real USDC on-chain) trading.
 
 ---
 
 ## 🏗 Architecture
 
-### Project Structure
-
 ```
-nyx/
-├── main.py                      # Entry point: DB init, bot startup, sanity checks
-├── config.py                    # Env vars + constants (endpoints, chain IDs)
-├── requirements.txt             # Python dependencies
-├── Procfile                     # Railway: worker: python main.py
-├── .env.example                 # Environment variable template
-├── README.md                    # You are here
-│
-├── bot/                         # Telegram bot layer
-│   ├── handlers.py              # All commands and callback query router
-│   ├── keyboards.py             # Inline keyboard layouts
-│   ├── formatters.py            # Message formatting utilities
-│   └── middleware.py             # Chat ID auth guard
-│
-├── core/                        # Trading engine
-│   ├── strategy.py              # Strategy orchestrator (registry-based)
-│   ├── scheduler.py             # APScheduler: trading loop, resolution, reconciler
-│   ├── trader.py                # FOK order execution and retry logic
-│   ├── resolver.py              # Slot resolution via Coinbase candles
-│   ├── trade_manager.py         # Pre-trade gate (hour filter, passthrough)
-│   ├── redeemer.py              # On-chain CTF redemption (EOA + Safe)
-│   ├── pending_queue.py         # Persistent JSON-backed retry queue
-│   └── strategies/              # Pluggable strategy plugins
-│       ├── __init__.py          # Registry: "pattern" -> PatternStrategy
-│       ├── base.py              # Abstract BaseStrategy interface
-│       └── pattern_strategy.py   # Multi-depth pattern matching (THE active strategy)
-│
-├── db/                          # Database layer
-│   ├── models.py                # SQLite schema + init + migrations
-│   └── queries.py               # All CRUD + analytics helpers
-│
-└── polymarket/                  # Polymarket API layer
-    ├── client.py                # ClobClient wrapper (L2 credential derivation)
-    ├── markets.py               # Slot boundaries, Gamma + CLOB price fetching
-    └── account.py               # Balance, positions, connection status
+main.py
+  ├── config.py                   # All env-var configuration
+  ├── db/
+  │   ├── models.py               # SQLite schema init, migrations
+  │   └── queries.py              # Async aiosqlite query layer
+  ├── polymarket/
+  │   ├── client.py               # PolymarketClient (CLOB auth + order placement)
+  │   └── markets.py              # Market discovery, slot timing, price fetch
+  ├── core/
+  │   ├── scheduler.py            # APScheduler loop — fires every 5-min slot
+  │   ├── strategy.py             # Strategy orchestrator (selects ML or Pattern)
+  │   ├── trader.py               # FOK order execution with retry + fill verification
+  │   ├── trade_manager.py        # Pre-trade gate (demo balance check, live passthrough)
+  │   ├── resolver.py             # Outcome resolution after slot expiry
+  │   ├── redeemer.py             # On-chain redemption of winning positions
+  │   ├── pending_queue.py        # Persistent queue for trades awaiting resolution
+  │   └── strategies/
+  │       ├── base.py             # BaseStrategy ABC — defines signal dict contract
+  │       ├── ml_strategy.py      # LightGBM model inference
+  │       └── pattern_strategy.py # Historical candlestick pattern matching
+  ├── ml/
+  │   ├── features.py             # 26-feature engineering (zero lookahead bias)
+  │   ├── trainer.py              # LightGBM training with walk-forward validation
+  │   ├── data_fetcher.py         # MEXC OHLCV + CVD data fetching (ccxt + REST)
+  │   └── model_store.py          # Model serialization / staging / promotion
+  └── bot/
+      ├── handlers.py             # All Telegram command handlers
+      └── formatters.py           # HTML message formatters for bot replies
 ```
-
-### Database Schema
-
-**4 Tables:**
-
-| Table | Purpose |
-|-------|---------|
-| `signals` | Every signal check -- side, price, pattern, win/loss |
-| `trades` | Executed orders -- amount, P&L, retries, status, demo flag |
-| `settings` | Key-value runtime config -- autotrade, sizing, demo |
-| `redemptions` | On-chain redemption records -- tx hash, gas, verified |
-
-**Default Settings** (seeded on first run):
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `autotrade_enabled` | `false` | Auto-execute trades |
-| `demo_trade_enabled` | `false` | Virtual paper trading |
-| `demo_bankroll_usdc` | `1000.00` | Starting virtual balance |
-| `auto_redeem_enabled` | `false` | Automatic on-chain redemption |
-| `trade_mode` | `fixed` | `fixed` or `pct` |
-| `trade_pct` | `5.0` | Percent sizing (pct mode) |
-| `trade_amount_usdc` | from env | Fixed sizing amount |
-
-### Key Technical Decisions
-
-- **Async-first**: `aiosqlite` and `httpx.AsyncClient` throughout; sync `py-clob-client` wrapped in `asyncio.to_thread()`
-- **Strategy Registry**: Pluggable via `core/strategies/__init__.py` -- add new strategies by registering them
-- **Graceful Degradation**: Coinbase API failure -> skip slot, retry next cycle
-- **Persistent Queue**: Unresolved slots in `data/pending_slots.json`, retried by reconciler every 5 min
-- **Startup Recovery**: Immediately resolves any stale signals from previous run
-- **Gnosis Safe Support**: Sig-type-2 redemptions use Safe.execTransaction with EOA-signed hashes
-- **Post-Tx Verification**: Balance check confirms position tokens are actually cleared after redemption
-- **Config Validation**: Required env vars checked at startup, with clear error messages
 
 ---
 
-## ⚡ Quick Start
+## 📁 Directory Structure
 
-1. **Clone and install**: `pip install -r requirements.txt`
-2. **Configure**: `cp .env.example .env` and fill in required credentials
-3. **Run**: `python main.py`
-4. **Test in demo mode**: Open Telegram -> `/settings` -> Toggle Demo ON
-5. **Monitor**: `/status`, `/signals`, `/demo`
-6. **Go live**: Toggle AutoTrade ON when ready
+```
+nyxmlopp/
+├── main.py                 # Entry point — starts bot + scheduler
+├── config.py               # Environment config (all env vars read here)
+├── requirements.txt        # Python dependencies
+├── .env.example            # Template for required environment variables
+├── autopoly.db             # SQLite database (created on first run)
+├── models/                 # Trained LightGBM model files (.lgb)
+│   ├── candidate.lgb       # Staged model (awaiting promotion)
+│   └── production.lgb      # Active production model
+├── core/                   # Trading engine
+├── ml/                     # ML pipeline
+├── bot/                    # Telegram interface
+├── db/                     # Database layer
+└── polymarket/             # Polymarket CLOB integration
+```
+
+---
+
+## 💹 Trading Modes
+
+### Live vs Demo
+
+| Mode | Description |
+|------|-------------|
+| **Live** | Real USDC trades on Polymarket CLOB via `py-clob-client` |
+| **Demo** | Simulated trades — no real orders placed, P&L tracked in DB |
+
+Toggle via the `/demo` Telegram command or the `DEMO_MODE` environment variable.
+
+### Demo Payout Structure
+
+In demo mode, simulated P&L uses Polymarket-style binary payout:
+- **Win:** `+0.85 × stake` profit (e.g. stake $1 → +$0.85)
+- **Lose:** `−1.0 × stake` loss (e.g. stake $1 → −$1.00)
+
+### Fixed vs PCT Stake Sizing
+
+| Mode | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| **fixed** | `TRADE_MODE=fixed` | — | Fixed USDC amount per trade (set via `FIXED_STAKE`) |
+| **pct** | `TRADE_MODE=pct` | `TRADE_PCT=5.0` | Percentage of available balance per trade |
+
+In PCT demo mode: win = `0.85 × stake` profit, lose = full stake loss.
+
+---
+
+## 🧠 Strategy Engine
+
+The active strategy is selected by `STRATEGY_NAME` env var (default: `"ml"`). Strategies are loaded via `core/strategy.py` which instantiates the correct class. All strategies implement `BaseStrategy` and return a standardized signal dict.
+
+### Signal Dictionary Schema
+
+```python
+{
+    "action":      "up" | "down" | "skip",  # trade direction or skip
+    "confidence":  float,                    # model probability (0–1)
+    "market_id":   str,                      # Polymarket market token ID
+    "slot_end_ts": int,                      # Unix timestamp of slot expiry
+    "reason":      str,                      # human-readable explanation
+    "price":       float | None,             # best ask price at signal time
+    "pattern":     str | None,               # matched pattern string (pattern strategy)
+    "win_rate":    float | None,             # historical WR of matched pattern
+}
+```
+
+### ML Strategy (`core/strategies/ml_strategy.py`)
+
+- Loads a pre-trained LightGBM model from `models/production.lgb`
+- Fetches live MEXC OHLCV + CVD data via `ml/data_fetcher.py`
+- Builds 26 features via `ml/features.py`
+- Produces a binary probability; fires a trade if confidence ≥ threshold
+- **Separate thresholds for UP and DOWN** directions (`ML_UP_THRESHOLD`, `ML_DOWN_THRESHOLD`)
+- Default threshold: **0.535** (targets ~64% WR at ~50 trades/day)
+- Excludes the current in-progress candle from inference (uses N−1 candles to predict N+1)
+- Supports hot-reload of the production model without restart (`/promote_model`)
+
+### Pattern Strategy (`core/strategies/pattern_strategy.py`)
+
+- Fetches the most recently **closed** 5-min BTC-USD candles from Coinbase Advanced Trade API
+- Always drops the most-recent API candle (may be in-progress) for safety
+- Reads the last **up to 10** fully closed candles and converts them to direction strings (`U`/`D`)
+- Builds pattern strings at depth 10, then 9 (longest-first greedy matching)
+- Looks up the pattern in the `patterns` DB table
+- If matched: trades the predicted direction for the N+1 candle
+- If no match: skips the slot
+
+---
+
+## 🔬 ML Model Pipeline
+
+### Data Sources
+
+All training data comes exclusively from **MEXC** (spot + futures):
+- **OHLCV:** MEXC spot BTC/USDT 5-minute candles via `ccxt`
+- **CVD (Cumulative Volume Delta):** MEXC futures kline API (`contract.mexc.com`)
+- **Multi-timeframe context:** 15-minute and 1-hour aggregations computed from 5-min data
+
+### Feature Engineering (`ml/features.py`)
+
+26 features — zero lookahead bias (all features use `shift(k≥1)`):
+
+| Group | Features |
+|-------|----------|
+| **Candle shape (7)** | `body_ratio_n1`, `body_ratio_n2`, `body_ratio_n3`, `upper_wick_n1`, `upper_wick_n2`, `lower_wick_n1`, `lower_wick_n2` |
+| **Volume (2)** | `volume_ratio_n1`, `volume_ratio_n2` |
+| **15m context (3)** | `body_ratio_15m`, `dir_15m`, `volume_ratio_15m` |
+| **1h context (3)** | `body_ratio_1h`, `dir_1h`, `volume_ratio_1h` |
+| **Funding (2)** | `funding_rate`, `funding_direction` |
+| **CVD (5)** | `cvd_delta_n1`, `cvd_delta_n2`, `cvd_slope`, `cvd_vs_price`, `cvd_acceleration` |
+| **Time-of-day (2)** | `hour_sin`, `hour_cos` |
+| **Volatility regime (2)** | `atr_ratio`, `vol_regime` |
+
+Target label: `1` = next candle closes UP, `0` = DOWN (`shift(-1)` — only used for training labels, never as a feature).
+
+### Training (`ml/trainer.py`)
+
+**Time-series split (no shuffling):**
+- Train: first 60% of data
+- Validation: 60%–75%
+- Test (hold-out): 75%–100%
+
+**Walk-forward cross-validation:**
+- Initial fold: 60% train+val block, 8% test
+- Each subsequent fold adds `WF_STEP_PCT` more data
+- Train/val split within each fold: 80/20
+
+**LightGBM Hyperparameters:**
+
+```python
+{
+    "objective":         "binary",
+    "metric":            "binary_logloss",
+    "learning_rate":     0.05,
+    "num_leaves":        63,
+    "max_depth":         -1,
+    "min_child_samples": 50,
+    "feature_fraction":  0.8,
+    "bagging_fraction":  0.8,
+    "bagging_freq":      5,
+    "reg_alpha":         0.1,
+    "reg_lambda":        0.1,
+    "n_jobs":            1,
+}
+NUM_BOOST_ROUND       = 1000
+EARLY_STOPPING_ROUNDS = 50
+```
+
+**Threshold sweep:** performed on validation set only (never on test set). The optimal threshold maximises win rate subject to a minimum trade count.
+
+### Deployment Gate
+
+> **Blueprint Rule 10:** A retrained model is only promoted to production if its **test-set win rate ≥ 58%**. If the gate is not met, `DeploymentBlockedError` is raised and the candidate model is NOT promoted.
+
+Model lifecycle:
+1. `/retrain` → trains a new model → saved as `models/candidate.lgb`
+2. `/promote_model` → validates gate → copies candidate → `models/production.lgb`
+3. ML strategy hot-reloads the new production model without restart
+
+### Model Store (`ml/model_store.py`)
+
+- `save_candidate(model)` — serializes to `models/candidate.lgb`
+- `promote_candidate()` — validates WR gate, moves candidate → production
+- `load_production()` — deserializes active model
+- Metadata (WR, threshold, training date) stored in `model_metadata` DB table
+
+---
+
+## ⏰ Scheduler Loop
+
+`core/scheduler.py` uses APScheduler (`AsyncIOScheduler`) to sync to 5-minute slot boundaries.
+
+**Timing:**
+- Slots align to `:00`, `:05`, `:10`, ..., `:55` of every hour (UTC)
+- Signal check fires at **T−85s** = `slot_start + 215s` (85 seconds before slot end)
+- At T−85s the current candle is still open; strategies use only confirmed-closed candles
+
+**Per-slot flow:**
+
+```
+T−85s  →  strategy.get_signal()
+            ↓ (if action != "skip")
+         trade_manager.maybe_trade()   # demo balance check / live passthrough
+            ↓
+         trader.execute_trade()        # FOK CLOB order, retry with backoff
+            ↓ (fill confirmed)
+         queries.insert_trade()        # persist to DB
+            ↓
+         Telegram notification
+            ↓
+         pending_queue.add()           # queued for resolution
+
+Slot expiry → resolver.resolve_pending()   # check Polymarket outcome API
+                ↓ (win)
+              redeemer.redeem()            # on-chain USDC redemption
+```
+
+**Additional scheduled jobs:**
+- Periodic redemption scan (interval configurable via `REDEMPTION_SCAN_INTERVAL`)
+- Startup recovery: `recover_unresolved()` re-queues any trades that were open at last shutdown
+
+---
+
+## 💬 Telegram Bot Commands
+
+All commands are restricted to the configured `TELEGRAM_CHAT_ID`.
+
+### General
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Welcome message and system status |
+| `/help` | Full command reference |
+| `/status` | Current bot status: mode, strategy, balance, active markets |
+| `/settings` | Show all current configuration settings |
+
+### Trading
+
+| Command | Description |
+|---------|-------------|
+| `/demo` | Toggle demo mode on/off |
+| `/trades [N]` | Show last N trades (default 10) with P&L |
+| `/signals` | Show the last signal generated |
+| `/redeem` | Manually trigger on-chain redemption of winning positions |
+| `/redemptions` | Show recent redemption history |
+
+### ML Model
+
+| Command | Description |
+|---------|-------------|
+| `/retrain` | Trigger a full model retrain (fetches fresh MEXC data, trains, saves as candidate) |
+| `/promote_model` | Promote the candidate model to production (validates ≥58% WR gate) |
+| `/model_status` | Show current model metadata: WR, threshold, training date, feature count |
+
+### Strategy & Thresholds
+
+| Command | Description |
+|---------|-------------|
+| `/set_threshold <value>` | Set the UP signal confidence threshold (e.g. `0.55`) |
+| `/set_down_threshold <value>` | Set the DOWN signal confidence threshold separately |
+| `/patterns` | List all stored candlestick patterns with win rates and trade counts |
+| `/pattern_add` | Add a new pattern manually |
+| `/pattern_delete` | Delete a stored pattern |
+
+---
+
+## ⚙️ Configuration — Environment Variables
+
+Copy `.env.example` to `.env` and fill in all required values.
+
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | Authorized Telegram chat ID (only this chat can control the bot) |
+| `POLY_API_KEY` | Polymarket CLOB API key |
+| `POLY_API_SECRET` | Polymarket CLOB API secret |
+| `POLY_API_PASSPHRASE` | Polymarket CLOB API passphrase |
+| `POLY_PRIVATE_KEY` | EVM wallet private key for on-chain redemption |
+
+### Trading
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEMO_MODE` | `true` | `true` = demo (simulated), `false` = live real trades |
+| `TRADE_MODE` | `fixed` | `fixed` = fixed stake per trade, `pct` = percentage of balance |
+| `FIXED_STAKE` | — | USDC amount per trade (used when `TRADE_MODE=fixed`) |
+| `TRADE_PCT` | `5.0` | Percentage of balance per trade (used when `TRADE_MODE=pct`) |
+| `DEMO_BALANCE` | — | Starting virtual balance for demo mode |
+
+### Strategy & Model
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STRATEGY_NAME` | `ml` | Active strategy: `ml` or `pattern` |
+| `ML_DEFAULT_THRESHOLD` | `0.535` | Default ML confidence threshold (both UP and DOWN) |
+| `ML_MODEL_DIR` | `./models` | Directory for LightGBM model files |
+
+### System
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_PATH` | `autopoly.db` | Path to SQLite database file |
+| `SIGNAL_LEAD_TIME` | `85` | Seconds before slot end to fire signal check |
+| `REDEMPTION_SCAN_INTERVAL` | — | Minutes between automatic redemption scans |
+
+---
+
+## 🗄️ Database Schema
+
+AutoPoly uses **aiosqlite** (async SQLite). Schema is auto-created and migrated on startup via `db/models.py`.
+
+### Tables
+
+| Table | Purpose |
+|-------|---------|
+| `trades` | All trade records: slot, direction, stake, fill price, outcome, P&L |
+| `signals` | Signal history: strategy, action, confidence, reason, market ID |
+| `patterns` | Pattern strategy table: pattern string, predicted direction, WR, trade count |
+| `model_metadata` | ML model versioning: WR, threshold, training timestamp, feature list |
+| `redemptions` | On-chain redemption records: trade ID, amount, tx hash, status |
+| `pending_queue` | Trades awaiting outcome resolution |
+| `demo_balance` | Virtual balance state for demo mode |
+| `settings` | Persistent runtime settings (thresholds, mode flags) overriding env vars |
+
+---
+
+## 🚀 Setup & Deployment
+
+### Prerequisites
+
+- Python 3.11+
+- MEXC account (public API, no auth needed for data)
+- Polymarket account with CLOB API credentials
+- EVM wallet funded with USDC on Polygon for live trading
+- Telegram bot token and authorized chat ID
+
+### Installation
+
+```bash
+git clone https://github.com/blinkinfo/nyxmlopp.git
+cd nyxmlopp
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your credentials
+```
+
+### Running
+
+```bash
+python main.py
+```
+
+On startup, `main.py`:
+1. Validates all required env vars
+2. Initializes and migrates the SQLite DB
+3. Loads the production LightGBM model (if strategy is `ml`)
+4. Recovers any unresolved trades from the previous session
+5. Starts the Telegram bot (polling)
+6. Starts the APScheduler loop
+
+### Initial Model Training
+
+Before running with the ML strategy, train an initial model:
+
+```
+/retrain    → trains and saves candidate model
+/promote_model → promotes to production (only if test WR >= 58%)
+```
+
+### Deployment on Railway / VPS
+
+- Set all env vars in Railway's environment panel
+- Use `DB_PATH=/data/autopoly.db` for persistent disk
+- Use `ML_MODEL_DIR=/data/models` for model persistence across deploys
+- The scheduler is single-process; no worker coordination needed
+
+---
+
+## 📐 Key Constants & Thresholds
+
+| Constant | Value | Location | Description |
+|----------|-------|----------|-------------|
+| `SIGNAL_LEAD_TIME` | 85s | `config.py` | Fire signal check 85s before slot end |
+| `ML_DEFAULT_THRESHOLD` | 0.535 | `config.py` | Default ML confidence threshold |
+| `WR_GATE` | 58% | `trainer.py` | Min test-set WR required to promote a new model |
+| `NUM_BOOST_ROUND` | 1000 | `trainer.py` | Max LightGBM boosting rounds |
+| `EARLY_STOPPING_ROUNDS` | 50 | `trainer.py` | Early stopping patience |
+| `WF_INITIAL_PCT` | 0.60 | `trainer.py` | Walk-forward initial train+val fraction |
+| Train/Val/Test split | 60/15/25% | `trainer.py` | Time-series split (no shuffle) |
+| Pattern depth | 10, 9 | `pattern_strategy.py` | Longest-first greedy pattern match |
+| Candle exclusion | N (current) | live inference | Drop current open candle; predict N+1 from N−1 |
+| Slot duration | 300s (5 min) | `polymarket/markets.py` | Market slot length |
+| FOK retry backoff | exponential | `trader.py` | Price refresh on each attempt |
+| LGBM `num_leaves` | 63 | `trainer.py` | Tree complexity |
+| LGBM `learning_rate` | 0.05 | `trainer.py` | Step size |
+| Feature count | 26 | `ml/features.py` | Total engineered features |
+| Demo win payout | 0.85× stake | `trade_manager.py` | Simulated Polymarket payout |
+| Demo loss | 1.0× stake | `trade_manager.py` | Full stake loss on loss |
 
 ---
 
@@ -371,43 +460,22 @@ nyx/
 
 | Package | Purpose |
 |---------|---------|
-| `py-clob-client>=0.34.0` | Polymarket CLOB order execution |
-| `python-telegram-bot>=20.0` | Telegram bot framework (async v20) |
-| `httpx>=0.25.0` | Async HTTP client for APIs |
-| `apscheduler>=3.10.0` | Task scheduling |
-| `python-dotenv>=1.0.0` | Environment variable loading |
-| `aiosqlite>=0.19.0` | Async SQLite driver |
-| `openpyxl>=3.1.0` | Excel file export |
-| `web3>=6.0.0` | On-chain redemption (CTF + Safe) |
+| `python-telegram-bot>=20.0` | Telegram async bot framework |
+| `apscheduler>=3.10.0` | Async cron scheduler |
+| `py-clob-client>=0.34.0` | Polymarket CLOB API client |
+| `aiosqlite>=0.19.0` | Async SQLite |
+| `lightgbm>=4.3.0` | LightGBM ML model |
+| `scikit-learn>=1.4.0` | Metrics (precision, recall, F1) |
+| `ccxt>=4.3.0` | MEXC OHLCV data fetching |
+| `httpx>=0.25.0` | Async HTTP client (MEXC CVD API) |
+| `pandas>=2.1.0` | Data manipulation |
+| `numpy>=1.26.0` | Numerical operations |
+| `web3>=6.0.0` | On-chain redemption |
+| `python-dotenv>=1.0.0` | `.env` file loading |
+| `openpyxl>=3.1.0` | Excel export (trade reports) |
 
 ---
 
-## 🔧 Extending: Adding New Strategies
+## ⚠️ Disclaimer
 
-The bot supports pluggable strategies via a registry pattern:
-
-1. Create a new class in `core/strategies/your_strategy.py` extending `BaseStrategy`
-2. Implement `async def check_signal() -> dict[str, Any] | None`
-3. Register in `core/strategies/__init__.py`: `STRATEGIES["your_strategy"] = YourStrategy`
-4. Set `STRATEGY_NAME=your_strategy` in your environment
-
-See `core/strategies/pattern_strategy.py` for a complete reference implementation.
-
----
-
-## ⚠ Risk Warning
-
-This is **experimental software** for educational purposes.
-
-Trading binary options carries **significant risk of loss**. The pattern strategy is based on historical analysis and **does not guarantee future results**.
-
-- Always test in **demo mode** first: `/settings` -> Toggle Demo ON
-- Monitor signal accuracy via `/signals` and `/demo` before enabling real trading
-- The bot makes **autonomous trading decisions** -- review your strategy regularly
-- **Only trade with funds you can afford to lose**
-
----
-
-## 📄 License
-
-MIT
+This software is for educational and research purposes. Binary options trading involves substantial risk of loss. Past performance of any ML model or pattern strategy is not indicative of future results. Use at your own risk.
