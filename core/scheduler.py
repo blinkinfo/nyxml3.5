@@ -110,7 +110,7 @@ async def _resolve_and_notify(signal_id: int, slug: str, side: str, entry_price:
     # Send trade result only if a trade was actually placed
     if trade_id is not None and amount_usdc is not None:
         if is_win:
-            pnl = round(amount_usdc * (1.0 / entry_price - 1.0), 4)
+            pnl = round(amount_usdc * 0.85, 4) if is_demo else round(amount_usdc * (1.0 / entry_price - 1.0), 4)
         else:
             pnl = -amount_usdc
         await queries.resolve_trade(trade_id, winner, is_win, pnl)
@@ -184,7 +184,7 @@ async def _reconcile_pending() -> None:
         pnl: float | None = None
         if trade_id is not None and amount_usdc is not None:
             if is_win:
-                pnl = round(amount_usdc * (1.0 / entry_price - 1.0), 4)
+                pnl = round(amount_usdc * 0.85, 4) if is_demo else round(amount_usdc * (1.0 / entry_price - 1.0), 4)
             else:
                 pnl = -amount_usdc
             await queries.resolve_trade(trade_id, winner, is_win, pnl)

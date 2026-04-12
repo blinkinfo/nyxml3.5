@@ -183,7 +183,7 @@ class MLStrategy(BaseStrategy):
         base_fields: dict[str, Any] = {
             "skipped": True,
             "pattern": None,
-            "candles_used": 50,
+            "candles_used": 300,
             "slot_n1_start_full": slot_n1["slot_start_full"],
             "slot_n1_end_full":   slot_n1["slot_end_full"],
             "slot_n1_start_str":  slot_n1["slot_start_str"],
@@ -202,12 +202,19 @@ class MLStrategy(BaseStrategy):
             # Fetch live data in parallel using executor (blocking ccxt calls)
             loop = asyncio.get_running_loop()
             df5, df15, df1h, funding_rate, cvd_live = await asyncio.gather(
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(50)),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(30)),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(20)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(300)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(50)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(30)),
                 loop.run_in_executor(None, data_fetcher.fetch_live_funding),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_cvd(25)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_cvd(310)),
             )
+
+            # Drop the still-forming (last) candle from each OHLCV DataFrame
+            # so live features are built only from fully-closed candles.
+            df5 = df5.iloc[:-1].reset_index(drop=True)
+            df15 = df15.iloc[:-1].reset_index(drop=True)
+            df1h = df1h.iloc[:-1].reset_index(drop=True)
+            cvd_live = cvd_live.iloc[:-1].reset_index(drop=True) if cvd_live is not None and len(cvd_live) > 0 else cvd_live
 
             # Update funding rolling buffer
             if funding_rate is not None:

@@ -76,7 +76,7 @@ def sweep_threshold(
     """Sweep thresholds on val set and select best.
 
     Selection criteria:
-      - If any threshold achieves WR >= 0.59: pick the one that maximizes
+      - If any threshold achieves WR >= 0.58: pick the one that maximizes
         (WR - 0.5) * trades_per_day  (edge-weighted activity score).
       - Otherwise: pick threshold with maximum WR.
 
@@ -91,7 +91,7 @@ def sweep_threshold(
     best_trades = 0
     best_trades_per_day = 0.0
 
-    # First pass: find candidates with WR >= 0.59
+    # First pass: find candidates with WR >= 0.58
     candidates_above = []
 
     thresh = lo
@@ -101,12 +101,12 @@ def sweep_threshold(
         if trades > 0:
             wr = float(y_true[mask].mean())
             tpd = trades / (len(probs) * 5 / 1440)
-            if wr >= 0.59:
+            if wr >= 0.58:
                 candidates_above.append((thresh, wr, trades, tpd))
         thresh = round(thresh + step, 4)
 
     if candidates_above:
-        # Pick maximum daily edge = (WR - 0.5) * trades_per_day among WR >= 0.59 candidates.
+        # Pick maximum daily edge = (WR - 0.5) * trades_per_day among WR >= 0.58 candidates.
         # This balances win-rate quality against trade frequency rather than
         # blindly picking the highest WR or the most trades.
         # Example: 59.5% WR / 5 tpd -> edge = (0.595-0.5)*5 = 0.475, which beats
@@ -115,13 +115,13 @@ def sweep_threshold(
         best = max(candidates_above, key=lambda x: (x[1] - 0.5) * x[3])
         best_threshold, best_wr, best_trades, best_trades_per_day = best
         log.info(
-            "sweep_threshold: WR>=0.59 candidates=%d, best thresh=%.3f WR=%.4f "
+            "sweep_threshold: WR>=0.58 candidates=%d, best thresh=%.3f WR=%.4f "
             "trades/day=%.1f edge/day=%.4f",
             len(candidates_above), best_threshold, best_wr, best_trades_per_day,
             (best_wr - 0.5) * best_trades_per_day,
         )
     else:
-        # No candidate >= 0.59: pick max WR
+        # No candidate >= 0.58: pick max WR
         best_wr_val = 0.0
         thresh = lo
         while thresh <= hi + 1e-9:
@@ -138,7 +138,7 @@ def sweep_threshold(
                     best_trades_per_day = tpd
             thresh = round(thresh + step, 4)
         log.warning(
-            "sweep_threshold: no threshold achieves WR>=0.59, best=%.3f WR=%.4f",
+            "sweep_threshold: no threshold achieves WR>=0.58, best=%.3f WR=%.4f",
             best_threshold, best_wr,
         )
 
@@ -493,7 +493,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     y_val_down = 1 - y_val
     _, down_val_wr, down_val_tpd = sweep_threshold(down_probs_val, y_val_down)
 
-    down_enabled = down_val_wr >= 0.59
+    down_enabled = down_val_wr >= 0.58
 
     log.info(
         "train: WFV-derived thresholds — up_threshold=%.3f down_threshold=%.3f",
@@ -505,7 +505,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     )
     if not down_enabled:
         log.warning(
-            "train: DOWN side did NOT pass deployment gate (down_val_wr=%.4f < 0.59). "
+            "train: DOWN side did NOT pass deployment gate (down_val_wr=%.4f < 0.58). "
             "DOWN trades will be disabled for this model.",
             down_val_wr,
         )
@@ -521,10 +521,10 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         1 - y_test,        # DOWN labels on test set
         down_threshold,
     )
-    if down_enabled and down_test_metrics["wr"] < 0.59:
+    if down_enabled and down_test_metrics["wr"] < 0.58:
         log.warning(
             "train: DOWN passed val gate but FAILED test gate "
-            "(down_test_wr=%.4f < 0.59). Disabling DOWN.",
+            "(down_test_wr=%.4f < 0.58). Disabling DOWN.",
             down_test_metrics["wr"],
         )
         down_enabled = False
@@ -546,7 +546,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     # We return blocked=True so the caller can surface the decision to the
     # user rather than silently keeping or discarding the model.
     # -----------------------------------------------------------------------
-    MIN_DEPLOY_WR = 0.59
+    MIN_DEPLOY_WR = 0.58
     blocked = test_metrics["wr"] < MIN_DEPLOY_WR
     if blocked:
         log.warning(

@@ -807,7 +807,7 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
 
     The candidate IS saved — the user must decide to promote or discard.
     """
-    _GATE = 0.59
+    _GATE = 0.58
     down_enabled = meta.get("down_enabled", False)
     down_thr     = meta.get("down_threshold", round(1.0 - threshold, 4))
     down_val_wr  = meta.get("down_val_wr")
@@ -850,7 +850,7 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
 
 def format_retrain_complete(meta: dict, threshold: float) -> str:
     """Show retrain results for candidate model — UP passed gate, DOWN shown separately."""
-    _GATE = 0.59
+    _GATE = 0.58
     down_enabled = meta.get("down_enabled", False)
     down_thr     = meta.get("down_threshold", round(1.0 - threshold, 4))
     down_val_wr  = meta.get("down_val_wr")

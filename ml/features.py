@@ -174,7 +174,7 @@ def build_features(
     atr15 = compute_atr14(df15)
     df15["body_ratio_15m"] = (df15["close"] - df15["open"]) / atr15
     df15["dir_15m"] = np.sign(df15["close"] - df15["open"])
-    df15["volume_ratio_15m"] = df15["volume"] / df15["volume"].rolling(20).mean()
+    df15["volume_ratio_15m"] = df15["volume"] / df15["volume"].rolling(20, min_periods=2).mean()
 
     r15 = _asof_backward(ts_n1, df15, ["body_ratio_15m", "dir_15m", "volume_ratio_15m"])
     df5["body_ratio_15m"] = r15["body_ratio_15m"].values
@@ -410,7 +410,7 @@ def build_live_features(
         fr = funding_rate_float
         if len(buf) >= 2:
             mean24 = np.mean(buf)
-            std24 = np.std(buf)
+            std24 = np.std(buf, ddof=1) if len(buf) >= 2 else 0.0
             funding_zscore = (fr - mean24) / std24 if std24 > 0 else np.nan
         else:
             funding_zscore = np.nan
@@ -496,7 +496,8 @@ def build_live_features(
     ]], dtype=np.float64)
 
     if np.isnan(row).any():
-        log.warning("build_live_features: NaN in feature row, skipping inference")
+        nan_features = [FEATURE_COLS[i] for i in range(len(FEATURE_COLS)) if np.isnan(row[0][i])]
+        log.warning("build_live_features: NaN in features, skipping inference. NaN features: %s", nan_features)
         return None
 
     return row
